@@ -8,7 +8,7 @@ from api.models import db
 import api.googleSheet as google_api
 
 # load .env at project root
-load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), '.env'), override=True)
+load_dotenv(dotenv_path=os.path.abspath(os.path.join(os.path.dirname(__file__), '.env')))
 
 def initialize_app():
     with app_module.app.app_context():
