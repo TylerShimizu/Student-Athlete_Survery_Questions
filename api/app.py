@@ -2,61 +2,38 @@ import os
 import json
 import re
 import pandas as pd
-from flask import Flask, render_template, redirect, jsonify, request, url_for, session
-from api.models import db, User, CartItem, Question
+from flask import Flask, render_template, redirect, jsonify, request, url_for, session, g, abort
+from api.models import db, User, CartItem
 import api.googleSheet as google_api
 from dotenv import load_dotenv
-from authlib.integrations.flask_client import OAuth
-from google.oauth2.credentials import Credentials
+from api.oauth import init_oauth, get_cred
+from api.decorators import login_required, token_required
 
 parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 dotenv_path = os.path.join(parent_dir, '.env')
 load_dotenv(dotenv_path=dotenv_path, override=True)
 
+# =============================================================================
+#                        ## SETTING UP APP ##
+# =============================================================================
+
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY") or os.urandom(24)
-app.static_folder = "static"
-basedir = os.path.abspath(os.path.dirname(__file__))
-
-oauth = OAuth(app)
-google = oauth.register(
-    name="google",
-    client_id=os.getenv("GOOGLE_CLIENT_ID"),
-    client_secret=os.getenv("GOOGLE_CLIENT_SECRET"),
-    access_token_url="https://oauth2.googleapis.com/token",
-    authorize_url="https://accounts.google.com/o/oauth2/auth",
-    authorize_params=None,
-    access_token_params=None,
-    api_base_url="https://www.googleapis.com/oauth2/v1/",
-    server_metadata_url=os.getenv("GOOGLE_DISCOVERY_URL"),
-    userinfo_endpoint="https://www.googleapis.com/oauth2/v2/userinfo",
-    client_kwargs={
-        'scope': (
-            'openid email profile '
-            'https://www.googleapis.com/auth/documents '
-            'https://www.googleapis.com/auth/drive.file'
-        )
-    }
-)
-
-##Possibly chnage this later to implement actual database
 app.config["SQLALCHEMY_DATABASE_URI"] = os.getenv("DATABASE_URL", "sqlite:///project.db")
+app.config['SESSION_TYPE'] = 'filesystem'
+app.config['SESSION_FILE_DIR'] = os.path.join(parent_dir, '.flask_session')
+app.config['SESSION_PERMANENT'] = False
 db.init_app(app)
-with app.app_context():
-    db.create_all()
-    sheets, id_and_questions, df = google_api.main()
 
+google = init_oauth(app)
+df = pd.DataFrame()
 CATEGORY_MAP = {}
-CATEGORIES = sorted(df["Category"].unique())
-for cat in CATEGORIES:
-    sub_cats = df[df["Category"] == cat]["Sub-Category"].unique()
-    CATEGORY_MAP[cat] = sorted(df[df["Category"] == cat]["Sub-Category"].unique())
+CATEGORIES = []
 LEVELS = {"Levels": []}
-LEVELS["Levels"].extend(sorted(df[df["Levels"].str.startswith("Level")]["Levels"].unique()))
-for other in sorted(df[~df["Levels"].str.startswith("Level")]["Levels"].unique()):
-    LEVELS[other] = [other]
 
-## APP ROUTES ##
+# =============================================================================
+#                             ## APP ROUTES ##
+# =============================================================================
 
 @app.route("/")
 @app.route("/home")
@@ -65,8 +42,10 @@ def home():
 
 @app.route("/about")
 def about():
-    return redirect('https://calbears.com/sports/2020/8/13/cameron-institute-about.aspx')
+    return redirect(os.getenv("ABOUT_PAGE_LINK"))
 
+
+# ============================== Logging ======================================
 @app.route("/login")
 def login():
     return google.authorize_redirect(url_for("callback", _external=True))
@@ -78,25 +57,163 @@ def callback():
     session["user"] = user_info
     session["token"] = token
 
-    # Check if the user already exists in the database
-    user = User.query.filter_by(email=user_info["email"]).first()
+    user = get_user_by_email(user_info["email"]) #Checking if user exists
     if not user:
-        # Create a new user if not exists
-        user = User(email=user_info["email"], name=user_info["name"], doc=None, form=None)
-        db.session.add(user)
-        db.session.commit()
+        user = create_new_user(email=user_info["email"], name=user_info["name"]) #Create new user
         session['cart'] = []
     else:
-        cart_items = [str(item.item_id) for item in user.cart_items]
-        session["cart"] = cart_items
+        session["cart"] = [str(item.item_id) for item in user.cart_items]
 
-    print(user_info)
     return redirect("/")
 
 @app.route("/logout")
 def logout():
     session.pop("user", None)
     return redirect(url_for("home"))
+
+# =============================== Cart Routes =================================
+# Display the user's cart
+@app.route('/cart', methods = ["GET", 'POST'])
+@login_required
+def view_cart():
+    return render_template('cartView.html')
+
+# Get the size of the user's cart
+@app.route('/getCartSize', methods=["POST"])
+def cartSize():
+    if g.user:
+        return jsonify({'cart_count': len(g.user.cart_items)})
+    return jsonify({'cart_count': 0})
+
+# Add an item to the user's cart
+@app.route('/add_to_cart', methods=['POST'])
+@login_required
+def add_to_cart():
+    questionId = request.get_json()['question_id']
+    message = ''
+
+    if not get_cart_item(g.user, int(questionId)):
+        new_cart_item = CartItem(user_id=g.user.id, item_id=int(questionId))
+        update_db("add", new_cart_item)
+        message = 'Question added to cart successfully!'
+    else:
+        message = 'Already in cart!'
+
+    return jsonify({
+        'message': message,
+        'cart_count': len(g.user.cart_items)
+    })
+
+# Remove an item from the user's cart
+@app.route('/removeItem', methods=['POST'])
+@login_required
+def removeItem():
+    itemId = request.get_json()['id']
+    cart_item = get_cart_item(g.user, int(itemId))
+
+    if cart_item:
+        update_db("delete", cart_item)
+    return jsonify({'cart-count': len(g.user.cart_items)})
+
+# =============================================================================
+#                             ## JS CALL ROUTES ##
+# =============================================================================
+
+# Function called by JS to get items in the cart
+@app.route('/cartView', methods = ["POST"])
+@login_required
+def cartView():
+    items = []
+    cart_items = CartItem.query.filter_by(user_id=g.user.id).all()
+    for item in cart_items:
+        question = df[df['id'] == item.item_id].iloc[0]
+        new_item = {
+            'title': question['Item Stem'],
+            'description': question['Anchors'].split(';'),
+            'path': question['Category'] + " - " + question['Sub-Category'],
+            'id': int(question['id']),
+            "level": question["Levels"]
+        }
+        items.append(new_item)
+    return jsonify(items)
+
+# Function called by JS to get all question data
+@app.route('/getData', methods=["POST"])
+def getData():
+    return jsonify(df.to_dict(orient='records'))
+
+# Function called by JS to export cart to preferred destination
+@app.route('/exporting', methods=["POST"])
+@token_required
+def exporting():
+    dest = request.form.get('dest')
+    data = json.loads(request.form.get('data'))
+    creds = get_cred(session["token"])
+    questions = pd.DataFrame()
+
+    for item in data:
+        questions = pd.concat([questions, df[(df["id"] == int(item))]])
+
+    export_to(destination=dest, data=questions, creds=creds, user=g.user)
+
+# Function called by JS to get summary of items in the cart listed in order by levels
+@app.route('/getSummary', methods=["POST"])
+@login_required
+def getSummary():
+    levels_in_cart = []    # Initialize a list to store the levels of items in the cart
+
+    cart_items = CartItem.query.filter_by(user_id=g.user.id).all()
+    for item in cart_items:
+        question = df[df['id'] == item.item_id].iloc[0]
+        levels_in_cart.append(question['Levels'])
+
+    levels_counts = pd.Series(levels_in_cart).value_counts().to_dict()
+
+    return jsonify(levels_counts)
+
+# =============================================================================
+#                             ## HELPER FUNCTIONS ##
+# =============================================================================
+
+def create_new_user(email, name, doc=None, form=None):
+    user = User(email=email, name=name, doc=doc, form=form)
+    db.session.add(user)
+    db.session.commit()
+    return user
+
+def get_user_by_email(email):
+    return User.query.filter_by(email=email).first()
+
+def get_request_form_list(request, fields):
+    return [request.form.getlist(field) if request.form.getlist(field) else [] for field in fields]
+
+def update_db(method, element):
+    if method == "add":
+        db.session.add(element)
+    elif method == "delete":
+        db.session.delete(element)
+    db.session.commit()
+
+def export_to(destination, data, creds, user):
+    if destination == 'forms':
+        if user.form:
+            form = google_api.update_form(data, creds, user.form)
+        else:
+            form = google_api.update_form(data, creds, None)
+            user.form = form
+            db.session.commit()
+        return redirect('https://docs.google.com/forms/d/' + form)
+    else:
+        if user.doc:
+            docId = google_api.create_doc(data, creds, user.doc)
+        else:
+            docId = google_api.create_doc(data, creds, None)
+            user.doc = docId
+            db.session.commit()
+        return redirect('https://docs.google.com/document/d/' + docId)
+
+def get_cart_item(user, item_id):
+    return CartItem.query.filter_by(user_id=user.id, item_id=item_id).first()
 
 def custom_sort(val):
     level_match = re.match(r'Level (\d)', val)
@@ -110,20 +227,18 @@ def showQuestions():
     Qs = pd.DataFrame()
     order = None
     search_term = request.args.get('searchQuery', '').lower()
-    print(search_term)
 
     if request.method == "POST":
-        search_query = request.form.get('searchQuery', '', str).lower()
-        print("searched:" + search_query)
-        subCategory = request.form.getlist('sub_category')
-        level = request.form.getlist('level')
-        category = request.form.getlist("category")
-        order = request.form.getlist("orderBy")
+        subCategory, level, category, order = get_request_form_list(request, ['sub_category', 'level', 'category', 'orderBy'])
 
         if level:
             for sub in subCategory:
-                cat, sub_cat = sub.split("->")
-                Qs = pd.concat([Qs, df[(df["Category"] == cat) & (df["Sub-Category"].str.startswith(sub_cat)) & (df["Levels"].isin(level))]])
+                if "->" in sub:
+                    cat, sub_cat = sub.split("->")
+                    Qs = pd.concat([Qs, df[(df["Category"] == cat) & (df["Sub-Category"].str.startswith(sub_cat)) & (df["Levels"].isin(level))]])
+                else:
+                    # Skip or handle malformed input
+                    continue
             for cat in category:
                 if not any(cat == sub.split('->')[0] for sub in subCategory):
                     Qs = pd.concat([Qs, df[(df["Category"] == cat) & (df["Levels"].isin(level))]])
@@ -132,12 +247,8 @@ def showQuestions():
 
         else:
             for sub in subCategory:
-                cat, sub_cat = sub.split("->")
-                Qs = pd.concat([Qs, df[(df["Category"] == cat) & (df["Sub-Category"].str.startswith(sub_cat))]])
-            for cat in category:
-                if not any(cat == sub.split('->')[0] for sub in subCategory):
-                    Qs = pd.concat([Qs, df[(df["Category"] == cat)]])
-
+                if "->" in sub:
+                    cat, sub_cat = sub.split("->")
     if Qs.empty:
         Qs = df
         if order:
@@ -145,163 +256,16 @@ def showQuestions():
                 Qs = Qs.sort_values(by=['Levels'], key=lambda x: x.map(custom_sort))
             else:
                 Qs = df.sort_values(by=['Sub-Category'])
-        questions = Qs.to_dict(orient='records')
     else:
         if order:
             if order[0] == "lev":
                 Qs = Qs.sort_values(by=['Levels'], key=lambda x: x.map(custom_sort))
             else:
                 Qs = Qs.sort_values(by=['Sub-Category'])
-        questions = Qs.to_dict(orient='records')
     
     if search_term:
         Qs = df[df["Item Stem"].str.lower().str.contains(search_term, regex=False)]
-        questions = Qs.to_dict(orient='records')
+
+    questions = Qs.to_dict(orient='records')
 
     return render_template('itemView.html', levels=LEVELS, categoryMap=CATEGORY_MAP, questions=questions)
-
-@app.route('/cart', methods = ["GET", 'POST'])
-def view_cart():
-    if 'user' in session:
-        return render_template('cartView.html')
-    else:
-        return redirect('/login')
-
-## JS Call Routes ##
-
-@app.route('/getData', methods=["POST"])
-def getData():
-    return jsonify(df.to_dict(orient='records'))
-
-@app.route('/getCartSize', methods=["POST"])
-def cartSize():
-    user = None
-    if "user" in session:
-        user = User.query.filter_by(email=session["user"]["email"]).first()
-    if user:
-        return jsonify({'cart_count': len(user.cart_items)})
-    return jsonify({'cart_count': 0})
-
-@app.route('/add_to_cart', methods=['POST'])
-def add_to_cart():
-    questionId = request.get_json()['question_id']
-    message = ''
-    if 'user' in session:
-        user = User.query.filter_by(email=session["user"]['email']).first()
-        user_id = user.id
-
-        inCart = CartItem.query.filter_by(user_id=user_id, item_id=int(questionId)).first()
-
-        if not inCart:
-            new_cart_item = CartItem(user_id=user_id, item_id=int(questionId))
-            db.session.add(new_cart_item)
-            db.session.commit()
-            message = 'Question added to cart successfully!'
-            # if questionId not in session['cart']:
-            #     session['cart'].append(questionId)
-        else:
-            message = 'Already in cart!'
-    else:
-        return redirect("/login")
-
-    return jsonify({
-        'message': message,
-        'cart_count': len(user.cart_items)
-    })
-
-@app.route('/removeItem', methods=['POST'])
-def removeItem():
-    itemId = request.get_json()['id']
-    user = User.query.filter_by(email=session["user"]['email']).first()
-
-    if user:
-
-        cart_item = CartItem.query.filter_by(user_id=user.id, item_id=itemId).first()
-
-        if cart_item:
-            db.session.delete(cart_item)
-            db.session.commit()
-            #session['cart'].remove(str(itemId))
-    else:
-        return redirect("/login")
-    return jsonify({'cart-count': len(user.cart_items)})
-
-@app.route('/cartView', methods = ["POST"])
-def cartView():
-    if 'user' in session:
-        user = User.query.filter_by(email=session["user"]["email"]).first()
-        user_id = user.id
-
-        items = []
-        cart_items = CartItem.query.filter_by(user_id=user_id).all()
-        for item in cart_items:
-            question = df[df['id'] == item.item_id].iloc[0]  # Retrieve the question row from the DataFrame
-            new_item = {
-                'title': question['Item Stem'],
-                'description': question['Anchors'].split(';'),
-                'path': question['Category'] + " - " + question['Sub-Category'],
-                'id': int(question['id']),
-                "level": question["Levels"]
-            }
-            items.append(new_item)
-        return jsonify(items)
-    else:
-        return redirect("/login")
-    
-@app.route('/exporting', methods=["POST"])
-def exporting():
-    if "token" not in session or "user" not in session:
-        return redirect("/login")
-
-    dest = request.form.get('dest')
-    data = json.loads(request.form.get('data'))
-    creds = Credentials(
-        token=session["token"]["access_token"],
-        refresh_token=session["token"].get("refresh_token"),
-        token_uri="https://oauth2.googleapis.com/token",
-        client_id=os.getenv("GOOGLE_CLIENT_ID"),
-        client_secret=os.getenv("GOOGLE_CLIENT_SECRET")
-    )
-
-    user = User.query.filter_by(email=session["user"]['email']).first()
-    if not user:
-        return redirect("/login")
-
-    questions = pd.DataFrame()
-
-    for item in data:
-        questions = pd.concat([questions, df[(df["id"] == int(item))]])
-    if dest == 'forms':
-        if user.form:
-            form = google_api.update_form(questions, creds, user.form)
-        else:
-            form = google_api.update_form(questions, creds, None)
-            user.form = form["formId"]
-            db.session.commit()
-        return redirect('https://docs.google.com/forms/d/' + form['formId'])
-    else:
-        if user.doc:
-            docId = google_api.create_doc(questions, creds, user.doc)
-        else:
-            docId = google_api.create_doc(questions, creds, None)
-            user.doc = docId
-            db.session.commit()
-        return redirect('https://docs.google.com/document/d/' + docId)
-    
-@app.route('/getSummary', methods=["POST"])
-def getSummary():
-    user = User.query.filter_by(email=session["user"]["email"]).first()
-    if not user:
-        return redirect("/login")
-    # Initialize a list to store the levels of items in the cart
-    levels_in_cart = []
-
-    cart_items = CartItem.query.filter_by(user_id=user.id).all()
-    for item in cart_items:
-        question = df[df['id'] == item.item_id].iloc[0]  # Retrieve the question row from the DataFrame
-        levels_in_cart.append(question['Levels'])
-
-    # Create a pandas Series from the list and get the counts of unique values
-    levels_counts = pd.Series(levels_in_cart).value_counts().to_dict()
-
-    return jsonify(levels_counts)

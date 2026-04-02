@@ -1,27 +1,48 @@
-from api.app import app
+import os
+from dotenv import load_dotenv
+import pandas as pd
+
+# import the app module so we can attach runtime objects onto it
+import api.app as app_module
+from api.models import db
+import api.googleSheet as google_api
+
+# load .env at project root
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), '.env'), override=True)
+
+def initialize_app():
+    with app_module.app.app_context():
+        # ensure database tables exist
+        db.create_all()
+
+        # attempt to load sheets/df; fall back to empty DataFrame on error
+        try:
+            _, _, df = google_api.main()
+        except Exception as e:
+            print("Warning: google_api.main() failed:", e)
+            df = pd.DataFrame()
+
+        # attach objects back onto api.app so routes can reference them
+        app_module.df = df
+
+        CATEGORIES = sorted(df["Category"].unique()) if not df.empty else []
+        app_module.CATEGORIES = CATEGORIES
+        app_module.CATEGORY_MAP = {
+            cat: sorted(df[df["Category"] == cat]["Sub-Category"].unique())
+            for cat in CATEGORIES
+        }
+
+        LEVELS = {"Levels": []}
+        if not df.empty:
+            LEVELS["Levels"].extend(
+                sorted(df[df["Levels"].str.startswith("Level")]["Levels"].unique())
+            )
+            for other in sorted(df[~df["Levels"].str.startswith("Level")]["Levels"].unique()):
+                LEVELS[other] = [other]
+        app_module.LEVELS = LEVELS
 
 if __name__ == "__main__":
-    app.run()
-
-# # Importing flask module in the project is mandatory
-# # An object of Flask class is our WSGI application.
-# from flask import Flask
-
-# # Flask constructor takes the name of 
-# # current module (__name__) as argument.
-# app = Flask(__name__)
-
-# # The route() function of the Flask class is a decorator, 
-# # which tells the application which URL should call 
-# # the associated function.
-# @app.route('/')
-# # ‘/’ URL is bound with hello_world() function.
-# def hello_world():
-#     return 'Hello World'
-
-# # main driver function
-# if __name__ == '__main__':
-
-#     # run() method of Flask class runs the application 
-#     # on the local development server.
-#     app.run()
+    initialize_app()
+    port = int(os.getenv("PORT", 5000))
+    debug = os.getenv("FLASK_DEBUG", "1") == "1"
+    app_module.app.run(host="0.0.0.0", port=port, debug=debug)
