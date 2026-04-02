@@ -119,6 +119,26 @@ def removeItem():
 #                             ## JS CALL ROUTES ##
 # =============================================================================
 
+# Main function to get questions based on filters, search, and sort options. 
+# Returns the questions in a format that can be easily rendered by the frontend.
+@app.route("/questions", methods = ["GET", "POST"])
+def showQuestions():
+    Qs = pd.DataFrame()
+    order = None
+    search_term = request.args.get('searchQuery', '').lower()
+
+    if request.method == "POST":
+        subCategory, level, category, order = get_request_form_list(request, ['sub_category', 'level', 'category', 'orderBy'])
+        Qs = apply_filters(df, category, subCategory, level)
+
+    if Qs.empty: #Default fallback
+        Qs = df.copy()
+
+    Qs = apply_search(Qs, search_term)
+    Qs = apply_sort(Qs, order)
+    questions = Qs.to_dict(orient='records')
+    return render_template('itemView.html', levels=LEVELS, categoryMap=CATEGORY_MAP, questions=questions)
+
 # Function called by JS to get items in the cart
 @app.route('/cartView', methods = ["POST"])
 @login_required
@@ -177,8 +197,7 @@ def getSummary():
 
 def create_new_user(email, name, doc=None, form=None):
     user = User(email=email, name=name, doc=doc, form=form)
-    db.session.add(user)
-    db.session.commit()
+    update_db("add", user)
     return user
 
 def get_user_by_email(email):
@@ -222,50 +241,25 @@ def custom_sort(val):
     else:
         return (1, val)  # Alphabetical order for non-levels
 
-@app.route("/questions", methods = ["GET", "POST"])
-def showQuestions():
-    Qs = pd.DataFrame()
-    order = None
-    search_term = request.args.get('searchQuery', '').lower()
-
-    if request.method == "POST":
-        subCategory, level, category, order = get_request_form_list(request, ['sub_category', 'level', 'category', 'orderBy'])
-
-        if level:
-            for sub in subCategory:
-                if "->" in sub:
-                    cat, sub_cat = sub.split("->")
-                    Qs = pd.concat([Qs, df[(df["Category"] == cat) & (df["Sub-Category"].str.startswith(sub_cat)) & (df["Levels"].isin(level))]])
-                else:
-                    # Skip or handle malformed input
-                    continue
-            for cat in category:
-                if not any(cat == sub.split('->')[0] for sub in subCategory):
-                    Qs = pd.concat([Qs, df[(df["Category"] == cat) & (df["Levels"].isin(level))]])
-            if Qs.empty:
-                Qs = df[df["Levels"].isin(level)]
-
-        else:
-            for sub in subCategory:
-                if "->" in sub:
-                    cat, sub_cat = sub.split("->")
-    if Qs.empty:
-        Qs = df
-        if order:
-            if order[0] == "lev":
-                Qs = Qs.sort_values(by=['Levels'], key=lambda x: x.map(custom_sort))
-            else:
-                Qs = df.sort_values(by=['Sub-Category'])
-    else:
-        if order:
-            if order[0] == "lev":
-                Qs = Qs.sort_values(by=['Levels'], key=lambda x: x.map(custom_sort))
-            else:
-                Qs = Qs.sort_values(by=['Sub-Category'])
-    
+def apply_search(Qs, search_term):
     if search_term:
-        Qs = df[df["Item Stem"].str.lower().str.contains(search_term, regex=False)]
+        Qs = Qs[Qs["Item Stem"].str.lower().str.contains(search_term, regex=False)]
+    return Qs
 
-    questions = Qs.to_dict(orient='records')
-
-    return render_template('itemView.html', levels=LEVELS, categoryMap=CATEGORY_MAP, questions=questions)
+def apply_sort(qs, order):
+    if not order:
+        return qs
+    if order[0] == "lev":
+        return qs.sort_values(by="Levels", key=lambda x: x.map(custom_sort))
+    else:
+        return qs.sort_values(by="Sub-Category")
+    
+def apply_filters(df, categories, subcategories, levels):
+    mask = pd.Series(True, index=df.index)
+    if categories:
+        mask &= df["Category"].isin(categories)
+    if subcategories:
+        mask &= df["Sub-Category"].isin(subcategories)
+    if levels:
+        mask &= df["Levels"].isin(levels)
+    return df[mask].copy() # Makes sure there is no accidental mutation

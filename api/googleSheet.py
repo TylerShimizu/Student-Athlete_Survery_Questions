@@ -40,59 +40,48 @@ flow = Flow.from_client_config(
 def main():
     try:
         data = {}
-        id = 0
         id_and_questions = {}
         master_df = pd.DataFrame()
         for spread in range_name:
             service = build("sheets", "v4", developerKey=API_KEY)
-
-            # Call the Sheets API
-            sheet = service.spreadsheets()
+            sheet = service.spreadsheets() # Call the Sheets API
             result = (
                 sheet.values()
                 .get(spreadsheetId=spreadsheet_id, range=spread)
                 .execute()
-            )
-            #Values is a list of the rows in the spreadsheets
-            
+            )   
             values = result.get("values", [])
-
             if not values:
-                print("No data found.")
-                return
+                print(f"No data found for {spread}")
+                continue
+            df = pd.DataFrame(values)
+
+            # First sheet: set headers
+            if master_df.empty:
+                df.columns = df.iloc[0]
+                df = df[1:]
             else:
-                df = pd.DataFrame(values)
-                if not master_df.empty:
-                    # Use the master_df's columns if it already has data
-                    df.columns = master_df.columns[:-1]  # Exclude the 'Category' column
-                else:
-                    # Set the first row as headers and drop it from the data
-                    df.columns = df.iloc[0]
-                    df = df[1:]
+                df.columns = master_df.columns[:-1]  # match existing columns
 
-                # Add the Category column
-                df['Category'] = spread[:len(spread) - 5]
+            # Add category (cleaner)
+            category_name = spread[:-5]  # assuming consistent format (how can we generalize this?)
+            df["Category"] = category_name
+            master_df = pd.concat([master_df, df], ignore_index=True) # Append WITHOUT dropping rows again
 
-                # Append the new DataFrame to the master DataFrame
-                master_df = pd.concat([master_df, df[1:]], ignore_index=True)
-
-            
             #Making each entry in values to be a Questions object
             category = spread[:len(spread) - 5]
             sub_categories = defaultdict(list)
             for i in range(len(values)):
                 temp = values[i]
                 temp[4] = temp[4].split("->")
-                sub = temp[4][0]
+                if len(temp) < 2:
+                    sub = temp[4][0]
+                else:
+                    sub = ""
 
                 q = Question.query.filter_by(level=temp[0], category=category, sub_category=sub, stem=temp[5], anchor=temp[7], method=temp[6]).first()
-
-                if q:
-        # Update last_updated timestamp
-                    q.last_updated = datetime.now()
-                else:
-                    #temp[7] = temp[7].split(";")
-                    new = Question( 
+                if not q: # Create a new Question object
+                    new = Question(
                         level = temp[0], 
                         category = category, 
                         sub_category = temp[4][0], 
@@ -101,22 +90,9 @@ def main():
                         method = temp[6]
                     )
                     db.session.add(new)
-                
-
                 db.session.commit()
+            data[category] = sub_categories #Adding sheet into data dictionary with its sheet name as keys
 
-                ### Might change the categories to add what type of entry the question is wanting to make displaying the Questions and options easier when exporting to PDF ###
-                # temp[7] = temp[7].split(";")
-                # values[i] = Questions(id, temp[0], temp[3], category, sub, temp[5], temp[6], temp[7])
-                # #sub = values[i].sub_cat.split("->")
-                # sub_categories[sub].append(values[i])
-                # id_and_questions[values[i].id] = values[i]
-                # id += 1
-
-
-            #Adding sheet into data dictionary with its sheet name as keys
-            data[category] = sub_categories
-        
         # Reset index of the final DataFrame for cleaner data
         master_df.reset_index(drop=True, inplace=True)
         master_df['id'] = master_df.index
@@ -129,19 +105,16 @@ def main():
 def create_doc(questions, creds, docId):
     try:
         service = build("docs", "v1", credentials=creds)
-        # If no docId, create a new document
-        if docId is None:
+        if docId is None: # If no docId, create a new document
             title = {
                 "title": "Sample Survey"
             }
             doc = service.documents().create(body=title).execute()
-            document_id = doc.get("documentId")
+            docId = doc.get("documentId")
         else:
-            document_id = docId
-
-            # Get the current document to find its length (needed for clearing)
-            doc = service.documents().get(documentId=document_id).execute()
-            content_length = doc.get("body", {}).get("content", [])[-1].get("endIndex", 1)
+            doc = service.documents().get(documentId=docId).execute() # Get the current document to find its length (needed for clearing)
+            content = doc.get("body", {}).get("content", [])
+            content_length = content[-1].get("endIndex", 1) if content else 1
 
             # Clear existing content (from index 1 to end)
             clear_request = [{
@@ -152,13 +125,12 @@ def create_doc(questions, creds, docId):
                     }
                 }
             }]
-            service.documents().batchUpdate(documentId=document_id, body={"requests": clear_request}).execute()
+            service.documents().batchUpdate(documentId=docId, body={"requests": clear_request}).execute()
 
         requests = []
         current_index = 1
 
-        for _, question in questions.iterrows():
-            # Insert the question text
+        for _, question in questions.iterrows(): # Insert the question text
             if question is not None:
                 requests.append({
                     "insertText": {
@@ -169,7 +141,6 @@ def create_doc(questions, creds, docId):
                     }
                 })
                 current_index += len(question["Item Stem"]) + 1
-
                 anchors = question["Anchors"].split(";")
                 if len(anchors) > 0:
                     for choice in anchors:
@@ -191,13 +162,13 @@ def create_doc(questions, creds, docId):
                 'bulletPreset': 'NUMBERED_DECIMAL_ALPHA_ROMAN_PARENS',
             }
         })
-
-        result = service.documents().batchUpdate(documentId=document_id, body={"requests": requests}).execute()
-
-        return document_id
+        service.documents().batchUpdate(documentId=docId, body={"requests": requests}).execute()
+        return docId
 
     except HttpError as err:
         print(f"An error occurred: {err}")
+    except Exception as err:
+        print(f"Unexpected error: {err}")
 
 
 if __name__ == "__main__":
